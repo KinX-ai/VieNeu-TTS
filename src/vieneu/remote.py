@@ -7,8 +7,8 @@ import asyncio
 import logging
 from .base import BaseVieneuTTS
 from .utils import _linear_overlap_add
-from vieneu_utils.phonemize_text import phonemize_with_dict, phonemize_batch
-from vieneu_utils.core_utils import split_text_into_chunks, join_audio_chunks
+from vieneu_utils.phonemize_text import phonemize_with_dict, phonemize_batch, normalize_to_chunks
+from vieneu_utils.core_utils import join_audio_chunks
 
 logger = logging.getLogger("Vieneu.Remote")
 
@@ -23,7 +23,8 @@ class RemoteVieNeuTTS(BaseVieneuTTS):
         model_name: str = "pnnbao-ump/VieNeu-TTS",
         codec_repo: str = "neuphonic/distill-neucodec",
         codec_device: str = "cpu",
-        hf_token: Optional[str] = None
+        hf_token: Optional[str] = None,
+        emotion: str = "natural",
     ):
         self.api_base = api_base.rstrip('/')
         self.model_name = model_name
@@ -36,31 +37,40 @@ class RemoteVieNeuTTS(BaseVieneuTTS):
         self.streaming_frames_per_chunk = 10
         self.streaming_stride_samples = self.streaming_frames_per_chunk * self.hop_length
 
+        # Set default emotion tag
+        self.default_emotion = "<|emotion_0|>" if emotion == "natural" else None
+        
+        # Only pnnbao-ump/VieNeu-TTS uses the full chat-format prompt
+        self.use_chat_format = model_name.rstrip("/").endswith("pnnbao-ump/VieNeu-TTS")
+
         self._load_voices_from_repo(model_name, hf_token)
 
     def _load_backbone(self, backbone_repo, backbone_device, hf_token=None):
         pass
 
 
-    def infer(self, text: str, ref_audio: Optional[Union[str, Path]] = None, ref_codes: Optional[Union[np.ndarray, 'torch.Tensor']] = None, ref_text: Optional[str] = None, max_chars: int = 256, silence_p: float = 0.15, crossfade_p: float = 0.0, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, skip_normalize: bool = False, apply_watermark: bool = True, **kwargs) -> np.ndarray:
+    def infer(self, text: str, ref_audio: Optional[Union[str, Path]] = None, ref_codes: Optional[Union[np.ndarray, 'torch.Tensor']] = None, ref_text: Optional[str] = None, max_chars: int = 256, silence_p: float = 0.15, crossfade_p: float = 0.0, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, repetition_penalty: float = 1.2, skip_normalize: bool = False, apply_watermark: bool = True, **kwargs) -> np.ndarray:
 
         ref_codes, ref_text = self._resolve_ref_voice(voice, ref_audio, ref_codes, ref_text)
 
-        if not skip_normalize:
-            text = self.normalizer.normalize(text)
-
-        chunks = split_text_into_chunks(text, max_chars=max_chars)
+        # Split TRƯỚC rồi normalize (punc_norm=True) từng chunk độc lập.
+        chunks = normalize_to_chunks(text, max_chars=max_chars, skip_normalize=skip_normalize)
         if not chunks:
             return np.array([], dtype=np.float32)
 
         if len(chunks) == 1:
-            prompt = self._format_prompt(ref_codes, ref_text, chunks[0])
+            prompt = self._format_prompt(
+                ref_codes, ref_text, chunks[0],
+                use_chat_format=self.use_chat_format,
+                emotion_tag=kwargs.get('emotion_tag', self.default_emotion)
+            )
             payload = {
                 "model": self.model_name,
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": 2048,
                 "temperature": temperature,
                 "top_k": top_k,
+                "repetition_penalty": repetition_penalty,
                 "stop": ["<|SPEECH_GENERATION_END|>"],
                 "stream": False
             }
@@ -76,32 +86,39 @@ class RemoteVieNeuTTS(BaseVieneuTTS):
                 logger.error(f"Error during remote inference: {e}")
                 return np.array([], dtype=np.float32)
 
-        # For multiple chunks, use async for parallel processing
+        # For multiple chunks, use async for parallel processing.
+        # Truyền raw `text` + skip_normalize gốc để infer_async tự split-first +
+        # normalize (punc_norm) từng chunk.
         return asyncio.run(self.infer_async(
             text, ref_codes=ref_codes, ref_text=ref_text,
             max_chars=max_chars, silence_p=silence_p, crossfade_p=crossfade_p,
-            temperature=temperature, top_k=top_k, skip_normalize=True, apply_watermark=True
+            temperature=temperature, top_k=top_k, repetition_penalty=repetition_penalty,
+            skip_normalize=skip_normalize, apply_watermark=True,
+            **kwargs
         ))
 
-    def infer_stream(self, text: str, ref_audio: Optional[Union[str, Path]] = None, ref_codes: Optional[Union[np.ndarray, 'torch.Tensor']] = None, ref_text: Optional[str] = None, max_chars: int = 256, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, skip_normalize: bool = False) -> Generator[np.ndarray, None, None]:
+    def infer_stream(self, text: str, ref_audio: Optional[Union[str, Path]] = None, ref_codes: Optional[Union[np.ndarray, 'torch.Tensor']] = None, ref_text: Optional[str] = None, max_chars: int = 256, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, repetition_penalty: float = 1.2, skip_normalize: bool = False, **kwargs) -> Generator[np.ndarray, None, None]:
 
         ref_codes, ref_text = self._resolve_ref_voice(voice, ref_audio, ref_codes, ref_text)
 
-        if not skip_normalize:
-            text = self.normalizer.normalize(text)
-
-        chunks = split_text_into_chunks(text, max_chars=max_chars)
+        # Split TRƯỚC rồi normalize (punc_norm=True) từng chunk độc lập.
+        chunks = normalize_to_chunks(text, max_chars=max_chars, skip_normalize=skip_normalize)
         for chunk in chunks:
-            yield from self._infer_stream_chunk(chunk, ref_codes, ref_text, temperature, top_k)
+            yield from self._infer_stream_chunk(chunk, ref_codes, ref_text, temperature, top_k, repetition_penalty, **kwargs)
 
-    def _infer_stream_chunk(self, chunk, ref_codes, ref_text, temperature, top_k):
-        prompt = self._format_prompt(ref_codes, ref_text, chunk)
+    def _infer_stream_chunk(self, chunk, ref_codes, ref_text, temperature, top_k, repetition_penalty, **kwargs):
+        prompt = self._format_prompt(
+            ref_codes, ref_text, chunk,
+            use_chat_format=self.use_chat_format,
+            emotion_tag=kwargs.get('emotion_tag', self.default_emotion)
+        )
         payload = {
             "model": self.model_name,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": 2048,
             "temperature": temperature,
             "top_k": top_k,
+            "repetition_penalty": repetition_penalty,
             "stop": ["<|SPEECH_GENERATION_END|>"],
             "stream": True
         }
@@ -160,7 +177,7 @@ class RemoteVieNeuTTS(BaseVieneuTTS):
             processed_recon = processed_recon[n_decoded_samples:]
             yield processed_recon
 
-    async def infer_async(self, text: str, ref_audio: Optional[Union[str, Path]] = None, ref_codes: Optional[Union[np.ndarray, 'torch.Tensor']] = None, ref_text: Optional[str] = None, max_chars: int = 256, silence_p: float = 0.15, crossfade_p: float = 0.0, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, session=None, skip_normalize: bool = False, apply_watermark: bool = True) -> np.ndarray:
+    async def infer_async(self, text: str, ref_audio: Optional[Union[str, Path]] = None, ref_codes: Optional[Union[np.ndarray, 'torch.Tensor']] = None, ref_text: Optional[str] = None, max_chars: int = 256, silence_p: float = 0.15, crossfade_p: float = 0.0, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, repetition_penalty: float = 1.2, session=None, skip_normalize: bool = False, apply_watermark: bool = True, **kwargs) -> np.ndarray:
         try:
             import aiohttp
         except ImportError:
@@ -168,10 +185,8 @@ class RemoteVieNeuTTS(BaseVieneuTTS):
 
         ref_codes, ref_text = self._resolve_ref_voice(voice, ref_audio, ref_codes, ref_text)
 
-        if not skip_normalize:
-            text = self.normalizer.normalize(text)
-
-        chunks = split_text_into_chunks(text, max_chars=max_chars)
+        # Split TRƯỚC rồi normalize (punc_norm=True) từng chunk độc lập.
+        chunks = normalize_to_chunks(text, max_chars=max_chars, skip_normalize=skip_normalize)
         if not chunks:
             return np.array([], dtype=np.float32)
 
@@ -181,7 +196,7 @@ class RemoteVieNeuTTS(BaseVieneuTTS):
             should_close_session = True
 
         try:
-            tasks = [self._infer_chunk_async(session, chunk, ref_codes, ref_text, temperature, top_k) for chunk in chunks]
+            tasks = [self._infer_chunk_async(session, chunk, ref_codes, ref_text, temperature, top_k, repetition_penalty, **kwargs) for chunk in chunks]
             wavs = await asyncio.gather(*tasks)
             final_wav = join_audio_chunks(wavs, self.sample_rate, silence_p, crossfade_p)
             if apply_watermark:
@@ -191,12 +206,12 @@ class RemoteVieNeuTTS(BaseVieneuTTS):
             if should_close_session:
                 await session.close()
 
-    def infer_batch(self, texts: List[str], ref_audio: Optional[Union[str, Path]] = None, ref_codes: Optional[Union[np.ndarray, 'torch.Tensor']] = None, ref_text: Optional[str] = None, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, skip_normalize: bool = False, apply_watermark: bool = True) -> List[np.ndarray]:
+    def infer_batch(self, texts: List[str], ref_audio: Optional[Union[str, Path]] = None, ref_codes: Optional[Union[np.ndarray, 'torch.Tensor']] = None, ref_text: Optional[str] = None, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, repetition_penalty: float = 1.2, skip_normalize: bool = False, apply_watermark: bool = True, **kwargs) -> List[np.ndarray]:
         """Synchronous wrapper for async batch inference."""
         return asyncio.run(self.infer_batch_async(
             texts, ref_audio=ref_audio, ref_codes=ref_codes, ref_text=ref_text,
-            voice=voice, temperature=temperature, top_k=top_k, skip_normalize=skip_normalize,
-            apply_watermark=apply_watermark
+            voice=voice, temperature=temperature, top_k=top_k, repetition_penalty=repetition_penalty,
+            skip_normalize=skip_normalize, apply_watermark=apply_watermark, **kwargs
         ))
 
     async def _infer_chunk_async(
@@ -207,17 +222,26 @@ class RemoteVieNeuTTS(BaseVieneuTTS):
         ref_text: str,
         temperature: float,
         top_k: int,
+        repetition_penalty: float,
         ref_phonemes: Optional[str] = None,
-        chunk_phonemes: Optional[str] = None
+        chunk_phonemes: Optional[str] = None,
+        **kwargs
     ) -> np.ndarray:
         """Internal helper for asynchronous chunk inference."""
-        prompt = self._format_prompt(ref_codes, ref_text, chunk, ref_phonemes=ref_phonemes, input_phonemes=chunk_phonemes)
+        prompt = self._format_prompt(
+            ref_codes, ref_text, chunk, 
+            ref_phonemes=ref_phonemes, 
+            input_phonemes=chunk_phonemes,
+            use_chat_format=self.use_chat_format,
+            emotion_tag=kwargs.get('emotion_tag', self.default_emotion)
+        )
         payload = {
             "model": self.model_name,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": 2048,
             "temperature": temperature,
             "top_k": top_k,
+            "repetition_penalty": repetition_penalty,
             "stop": ["<|SPEECH_GENERATION_END|>"],
             "stream": False
         }
@@ -231,44 +255,41 @@ class RemoteVieNeuTTS(BaseVieneuTTS):
             logger.error(f"Error in async chunk: {e}")
             return np.array([], dtype=np.float32)
 
-    async def infer_batch_async(self, texts: List[str], ref_audio: Optional[Union[str, Path]] = None, ref_codes: Optional[Union[np.ndarray, 'torch.Tensor']] = None, ref_text: Optional[str] = None, max_chars: int = 256, silence_p: float = 0.15, crossfade_p: float = 0.0, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, concurrency_limit: int = 50, skip_normalize: bool = False, apply_watermark: bool = True) -> List[np.ndarray]:
+    async def infer_batch_async(self, texts: List[str], ref_audio: Optional[Union[str, Path]] = None, ref_codes: Optional[Union[np.ndarray, 'torch.Tensor']] = None, ref_text: Optional[str] = None, max_chars: int = 256, silence_p: float = 0.15, crossfade_p: float = 0.0, voice: Optional[Dict[str, Any]] = None, temperature: float = 1.0, top_k: int = 50, repetition_penalty: float = 1.2, concurrency_limit: int = 50, skip_normalize: bool = False, apply_watermark: bool = True, **kwargs) -> List[np.ndarray]:
         try:
             import aiohttp
         except ImportError:
             raise ImportError("Async requires 'aiohttp'.")
 
-        if not skip_normalize:
-            texts = [self.normalizer.normalize(t) for t in texts]
-
         ref_codes, ref_text = self._resolve_ref_voice(voice, ref_audio, ref_codes, ref_text)
 
-        # Pre-phonemize all for performance
         ref_phonemes = self.get_ref_phonemes(ref_text)
-        all_phonemes = phonemize_batch(texts, skip_normalize=True)
 
         sem = asyncio.Semaphore(concurrency_limit)
         async with aiohttp.ClientSession() as session:
-            async def bounded_infer(text, ph):
+            async def bounded_infer(raw_text):
                 async with sem:
-                    # Split into chunks internally if needed
-                    chunks = split_text_into_chunks(text, max_chars=max_chars)
+                    # Split TRƯỚC rồi normalize (punc_norm=True) từng chunk độc lập,
+                    # sau đó phonemize (punc_norm=True). Mỗi chunk vì thế luôn có
+                    # dấu câu kết thúc hợp lệ — không kết thúc lửng hay bằng ",".
+                    chunks = normalize_to_chunks(raw_text, max_chars=max_chars, skip_normalize=skip_normalize)
                     if not chunks: return np.array([], dtype=np.float32)
 
+                    chunk_phonemes = phonemize_batch(chunks, skip_normalize=True)
+
                     if len(chunks) == 1:
-                        wav = await self._infer_chunk_async(session, chunks[0], ref_codes, ref_text, temperature, top_k, ref_phonemes=ref_phonemes, chunk_phonemes=ph)
+                        wav = await self._infer_chunk_async(session, chunks[0], ref_codes, ref_text, temperature, top_k, repetition_penalty, ref_phonemes=ref_phonemes, chunk_phonemes=chunk_phonemes[0], **kwargs)
                         if apply_watermark: wav = self._apply_watermark(wav)
                         return wav
 
-                    # Re-phonemize chunks if splitting happened
-                    chunk_phonemes = phonemize_batch(chunks, skip_normalize=True)
-                    tasks = [self._infer_chunk_async(session, c, ref_codes, ref_text, temperature, top_k, ref_phonemes=ref_phonemes, chunk_phonemes=c_ph)
+                    tasks = [self._infer_chunk_async(session, c, ref_codes, ref_text, temperature, top_k, repetition_penalty, ref_phonemes=ref_phonemes, chunk_phonemes=c_ph, **kwargs)
                             for c, c_ph in zip(chunks, chunk_phonemes)]
                     wavs = await asyncio.gather(*tasks)
                     final_wav = join_audio_chunks(wavs, self.sample_rate, silence_p, crossfade_p)
                     if apply_watermark: final_wav = self._apply_watermark(final_wav)
                     return final_wav
 
-            tasks = [bounded_infer(text, ph) for text, ph in zip(texts, all_phonemes)]
+            tasks = [bounded_infer(t) for t in texts]
             results = await asyncio.gather(*tasks)
 
         return results

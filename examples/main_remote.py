@@ -17,8 +17,8 @@ def main():
     
     # Replace with your actual LMDeploy server URL
     # Example: 'http://localhost:23333/v1' or a public tunnel URL
-    REMOTE_API_BASE = 'http://bore.pub:34939/v1' # Replace with your actual LMDeploy server URL
-    REMOTE_MODEL_ID = "pnnbao-ump/VieNeu-TTS"
+    REMOTE_API_BASE = 'http://localhost:23333/v1' # Replace with your actual server URL
+    REMOTE_MODEL_ID = "pnnbao-ump/VieNeu-TTS-v2"
 
     # ---------------------------------------------------------
     # PART 1: INITIALIZATION
@@ -27,10 +27,11 @@ def main():
     # It only loads a small Codec (distill-neucodec) to encode/decode audio instantly.
     print(f"📡 Connecting to server: {REMOTE_API_BASE}...")
     try:
-        tts = Vieneu(
+        vieneu = Vieneu(
             mode='remote', 
             api_base=REMOTE_API_BASE, 
-            model_name=REMOTE_MODEL_ID
+            model_name=REMOTE_MODEL_ID,
+            emotion='natural' # Default style
         )
     except Exception as e:
         print(f"❌ Failed to connect: {e}")
@@ -40,7 +41,7 @@ def main():
     # PART 2: LIST REMOTE VOICES
     # ---------------------------------------------------------
     # Fetch available voice presets from the remote server
-    available_voices = tts.list_preset_voices()
+    available_voices = vieneu.list_preset_voices()
     print(f"📋 Found {len(available_voices)} remote voices.")
     
     if available_voices:
@@ -60,13 +61,13 @@ def main():
         print(f"👤 Synthesis voice: {desc} (ID: {voice_id})")
         
         # Get reference data for this specific voice
-        voice_data = tts.get_preset_voice(voice_id)
+        voice_data = vieneu.get_preset_voice(voice_id)
         
         test_text = f"Chào bạn, tôi đang nói bằng giọng của {desc}."
-        audio_spec = tts.infer(text=test_text, voice=voice_data)
+        audio_spec = vieneu.infer(text=test_text, voice=voice_data)
         
         save_path = f"outputs/remote_{voice_id}.wav"
-        tts.save(audio_spec, save_path)
+        vieneu.save(audio_spec, save_path)
         print(f"💾 Saved synthesis to: {save_path}")
 
     # ---------------------------------------------------------
@@ -77,9 +78,9 @@ def main():
     
     print("🎧 Sending synthesis request to server...")
     # The SDK handles splitting long text and joining results automatically
-    audio = tts.infer(text=text_input)
+    audio = vieneu.infer(text=text_input)
     
-    tts.save(audio, "outputs/remote_output.wav")
+    vieneu.save(audio, "outputs/remote_output.wav")
     print("💾 Saved remote synthesis to: outputs/remote_output.wav")
 
     # ---------------------------------------------------------
@@ -93,24 +94,46 @@ def main():
     if os.path.exists(ref_audio):
         print("\n--- PART 5: Remote Voice Cloning ---")
         print(f"🦜 Encoding {ref_audio} locally and sending codes to server...")
-        cloned_audio = tts.infer(
+        cloned_audio = vieneu.infer(
             text="Đây là giọng nói được clone và xử lý thông qua VieNeu Server.",
             ref_audio=ref_audio,
             ref_text=ref_text
         )
-        tts.save(cloned_audio, "outputs/remote_cloned_output.wav")
+        vieneu.save(cloned_audio, "outputs/remote_cloned_output.wav")
         print("💾 Saved remote cloned voice to: outputs/remote_cloned_output.wav")
+    
+    # ---------------------------------------------------------
+    # PART 6: STYLE SWITCHING & SAMPLING PARAMS
+    # ---------------------------------------------------------
+    print("\n--- PART 6: Style Switching & Sampling ---")
+    print("🎭 Testing Natural vs Storytelling styles...")
+    
+    # Natural style (using explicit emotion_tag)
+    audio_nat = vieneu.infer(
+        "Tôi đang nói bằng phong cách tự nhiên, phù hợp cho trợ lý ảo.",
+        emotion_tag="<|emotion_0|>"
+    )
+    vieneu.save(audio_nat, "outputs/remote_style_natural.wav")
+    
+    # Storytelling style (None tag) with repetition penalty
+    audio_story = vieneu.infer(
+        "Ngày xửa ngày xưa, có một con rồng sống trong hang động sâu thẳm...",
+        emotion_tag=None,
+        repetition_penalty=1.2
+    )
+    vieneu.save(audio_story, "outputs/remote_style_story.wav")
+    print("💾 Saved style variations to outputs/")
 
     # ---------------------------------------------------------
-    # PART 6: NATIVE ASYNC INFERENCE (High Performance)
+    # PART 7: NATIVE ASYNC INFERENCE (High Performance)
     # ---------------------------------------------------------
-    print("\n📌 PART 6: Native Async Processing")
+    print("\n📌 PART 7: Native Async Processing")
     print("=" * 60)
     
     # Define voice for async tasks (Using index 0 as default)
     if available_voices:
         _, batch_voice_id = available_voices[0]
-        voice_data_batch = tts.get_preset_voice(batch_voice_id)
+        voice_data_batch = vieneu.get_preset_voice(batch_voice_id)
     else:
         voice_data_batch = None
 
@@ -129,7 +152,7 @@ def main():
             
             start_async = time.time()
             # infer_batch_async maintains order and manages concurrency internally
-            batch_results = await tts.infer_batch_async(
+            batch_results = await vieneu.infer_batch_async(
                 async_batch_texts, 
                 voice=voice_data_batch,
                 concurrency_limit=10
@@ -139,7 +162,7 @@ def main():
             print(f"✅ Async Batch completed in {elapsed_async:.2f}s")
             
             for i, wav in enumerate(batch_results):
-                tts.save(wav, f"outputs/remote_native_batch_async_{i}.wav")
+                vieneu.save(wav, f"outputs/remote_native_batch_async_{i}.wav")
             print(f"💾 Saved {len(batch_results)} async batch files.")
 
         # Run the async loop
@@ -151,7 +174,7 @@ def main():
         print(f"⚠️  Async example error: {e}")
 
     # ---------------------------------------------------------
-    # PART 7: DONE
+    # PART 8: DONE
     # ---------------------------------------------------------
     print("\n✅ All remote tasks completed!")
     print("📁 Check the 'outputs/' folder for generated files.")

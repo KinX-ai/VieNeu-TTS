@@ -7,8 +7,8 @@ import gc
 import logging
 from .base import BaseVieneuTTS
 from .utils import extract_speech_ids, _linear_overlap_add, normalize_device
-from vieneu_utils.phonemize_text import phonemize_with_dict, phonemize_batch
-from vieneu_utils.core_utils import split_text_into_chunks, join_audio_chunks
+from vieneu_utils.phonemize_text import phonemize_with_dict, phonemize_batch, normalize_to_chunks
+from vieneu_utils.core_utils import join_audio_chunks
 
 logger = logging.getLogger("Vieneu.Standard")
 
@@ -20,12 +20,13 @@ class VieNeuTTS(BaseVieneuTTS):
 
     def __init__(
         self,
-        backbone_repo: str = "pnnbao-ump/VieNeu-TTS-0.3B",
+        backbone_repo: str = "pnnbao-ump/VieNeu-TTS-v2",
         backbone_device: str = "cpu",
         codec_repo: str = "neuphonic/neucodec-onnx-decoder-int8",
         codec_device: str = "cpu",
         hf_token: Optional[str] = None,
-        gguf_filename: Optional[str] = "VieNeu-TTS-0.3B-Q4_K_M.gguf",
+        gguf_filename: Optional[str] = "VieNeu-TTS-v2-Q4-K-M.gguf",
+        emotion: str = "natural",
     ):
         super().__init__()
 
@@ -44,6 +45,9 @@ class VieNeuTTS(BaseVieneuTTS):
 
         # Only pnnbao-ump/VieNeu-TTS uses the full chat-format prompt
         self.use_chat_format = backbone_repo.rstrip("/").endswith("pnnbao-ump/VieNeu-TTS")
+        
+        # Set default emotion tag
+        self.default_emotion = "<|emotion_0|>" if emotion == "natural" else None
 
         if backbone_repo:
             self._load_backbone(backbone_repo, backbone_device, hf_token, gguf_filename)
@@ -193,10 +197,8 @@ class VieNeuTTS(BaseVieneuTTS):
 
         ref_codes, ref_text = self._resolve_ref_voice(voice, ref_audio, ref_codes, ref_text)
 
-        if not skip_normalize:
-            text = self.normalizer.normalize(text)
-
-        chunks = split_text_into_chunks(text, max_chars=max_chars)
+        # Split TRƯỚC rồi normalize (punc_norm=True) từng chunk độc lập.
+        chunks = normalize_to_chunks(text, max_chars=max_chars, skip_normalize=skip_normalize)
         if not chunks:
             return np.array([], dtype=np.float32)
 
@@ -204,9 +206,9 @@ class VieNeuTTS(BaseVieneuTTS):
             ref_phonemes = self.get_ref_phonemes(ref_text)
             phonemes = phonemize_with_dict(chunks[0], skip_normalize=True)
             if self._is_quantized_model:
-                output_str = self._infer_ggml(ref_codes, ref_phonemes, phonemes, temperature, top_k, emotion_tag=kwargs.get('emotion_tag'))
+                output_str = self._infer_ggml(ref_codes, ref_phonemes, phonemes, temperature, top_k, emotion_tag=kwargs.get('emotion_tag', self.default_emotion))
             else:
-                prompt_ids = self._apply_chat_template(ref_codes, ref_phonemes, phonemes, emotion_tag=kwargs.get('emotion_tag'))
+                prompt_ids = self._apply_chat_template(ref_codes, ref_phonemes, phonemes, emotion_tag=kwargs.get('emotion_tag', self.default_emotion))
                 output_str = self._infer_torch(prompt_ids, temperature, top_k)
             wav = self._decode(output_str)
             if apply_watermark:
@@ -241,7 +243,7 @@ class VieNeuTTS(BaseVieneuTTS):
         # If model is GGUF, we still process sequentially for now as llama-cpp-python batching for TTS is complex
         if self._is_quantized_model:
             for phonemes in chunk_phonemes:
-                output_str = self._infer_ggml(ref_codes, ref_phonemes, phonemes, temperature, top_k)
+                output_str = self._infer_ggml(ref_codes, ref_phonemes, phonemes, temperature, top_k, emotion_tag=kwargs.get('emotion_tag', self.default_emotion))
                 wav = self._decode(output_str)
                 if apply_watermark:
                     wav = self._apply_watermark(wav)
@@ -251,7 +253,7 @@ class VieNeuTTS(BaseVieneuTTS):
             import torch
             batch_prompt_ids = []
             for phonemes in chunk_phonemes:
-                prompt_ids = self._apply_chat_template(ref_codes, ref_phonemes, phonemes, emotion_tag=kwargs.get('emotion_tag'))
+                prompt_ids = self._apply_chat_template(ref_codes, ref_phonemes, phonemes, emotion_tag=kwargs.get('emotion_tag', self.default_emotion))
                 batch_prompt_ids.append(torch.tensor(prompt_ids))
 
             inputs = self.tokenizer.pad(
@@ -290,10 +292,8 @@ class VieNeuTTS(BaseVieneuTTS):
 
         ref_codes, ref_text = self._resolve_ref_voice(voice, ref_audio, ref_codes, ref_text)
 
-        if not skip_normalize:
-            text = self.normalizer.normalize(text)
-
-        chunks = split_text_into_chunks(text, max_chars=max_chars)
+        # Split TRƯỚC rồi normalize (punc_norm=True) từng chunk độc lập.
+        chunks = normalize_to_chunks(text, max_chars=max_chars, skip_normalize=skip_normalize)
         if not chunks:
             return
 
@@ -303,9 +303,9 @@ class VieNeuTTS(BaseVieneuTTS):
 
         for phonemes in chunk_phonemes:
             if self._is_quantized_model:
-                yield from self._infer_stream_ggml(ref_codes, ref_phonemes, phonemes, temperature, top_k, emotion_tag=kwargs.get('emotion_tag'))
+                yield from self._infer_stream_ggml(ref_codes, ref_phonemes, phonemes, temperature, top_k, emotion_tag=kwargs.get('emotion_tag', self.default_emotion))
             else:
-                prompt_ids = self._apply_chat_template(ref_codes, ref_phonemes, phonemes, emotion_tag=kwargs.get('emotion_tag'))
+                prompt_ids = self._apply_chat_template(ref_codes, ref_phonemes, phonemes, emotion_tag=kwargs.get('emotion_tag', self.default_emotion))
                 output_str = self._infer_torch(prompt_ids, temperature, top_k)
                 wav = self._decode(output_str)
                 yield self._apply_watermark(wav)
@@ -332,7 +332,8 @@ class VieNeuTTS(BaseVieneuTTS):
             text_replace_idx = ids.index(text_replace)
             ids = ids[:text_replace_idx] + [text_prompt_start] + input_ids + [text_prompt_end] + ids[text_replace_idx + 1:]
 
-            ids = ids[:speech_replace] + [speech_gen_start] + list(codes)
+            speech_replace_idx = ids.index(speech_replace)
+            ids = ids[:speech_replace_idx] + [speech_gen_start] + list(codes)
         else:
             emotion_prefix_ids = self.tokenizer.encode(emotion_tag, add_special_tokens=False) if emotion_tag else []
             ids = [text_prompt_start] + emotion_prefix_ids + input_ids + [text_prompt_end, speech_gen_start] + list(codes)
